@@ -108,7 +108,7 @@ Extract ALL wines visible. If a price is missing, use 0.`;
 // Bing Search helpers
 // ---------------------------------------------------------------------------
 
-const BING_ENDPOINT = 'https://api.bing.microsoft.com/v7.0/search';
+const SERPER_ENDPOINT = 'https://google.serper.dev/search';
 
 function extractRating(text: string): { score: number; source: string } | null {
   const patterns: Array<{ regex: RegExp; scale?: number }> = [
@@ -173,19 +173,21 @@ async function searchWineInfo(wine: Wine): Promise<SearchInfo> {
   const query = `${wine.name} ${vintageStr} wine rating points retail price`.replace(/\s+/g, ' ').trim();
 
   try {
-    const resp = await fetch(
-      `${BING_ENDPOINT}?q=${encodeURIComponent(query)}&count=7&responseFilter=Webpages`,
-      {
-        headers: { 'Ocp-Apim-Subscription-Key': process.env.BING_API_KEY! },
-        signal: AbortSignal.timeout(8000),
-      }
-    );
+    const resp = await fetch(SERPER_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'X-API-KEY': process.env.SERPER_API_KEY!,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ q: query, num: 7 }),
+      signal: AbortSignal.timeout(8000),
+    });
 
-    if (!resp.ok) throw new Error(`Bing returned ${resp.status}`);
+    if (!resp.ok) throw new Error(`Serper returned ${resp.status}`);
 
     const data = await resp.json();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const results: any[] = data.webPages?.value ?? [];
+    const results: any[] = data.organic ?? [];
 
     let rating: number | null = null;
     let ratingSource: string | null = null;
@@ -193,14 +195,14 @@ async function searchWineInfo(wine: Wine): Promise<SearchInfo> {
     const snippets: string[] = [];
 
     for (const r of results) {
-      const combined = `${r.name ?? ''} ${r.snippet ?? ''}`;
+      const combined = `${r.title ?? ''} ${r.snippet ?? ''}`;
       snippets.push(r.snippet ?? '');
 
       if (!rating) {
         const found = extractRating(combined);
         if (found) {
           rating = found.score;
-          ratingSource = sourceFromUrl(r.url ?? '');
+          ratingSource = sourceFromUrl(r.link ?? '');
         }
       }
 
@@ -254,8 +256,8 @@ export async function POST(request: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) {
       return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not configured.' }, { status: 500 });
     }
-    if (!process.env.BING_API_KEY) {
-      return NextResponse.json({ error: 'BING_API_KEY is not configured.' }, { status: 500 });
+    if (!process.env.SERPER_API_KEY) {
+      return NextResponse.json({ error: 'SERPER_API_KEY is not configured.' }, { status: 500 });
     }
 
     const formData = await request.formData();
