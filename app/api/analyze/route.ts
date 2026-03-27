@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 
+// Allow up to 55 seconds on Vercel Hobby (hard limit is 60s)
+export const maxDuration = 55;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -25,6 +28,7 @@ export interface WineResult extends Wine {
 export interface AnalyzeResponse {
   wines: WineResult[];
   totalFound: number;
+  searchedCount: number;
   analyzedCount: number;
 }
 
@@ -164,21 +168,34 @@ function extractRating(text: string): { score: number; source: string } | null {
 
 function extractRetailPrice(text: string): number | null {
   const patterns = [
+    // High-confidence: explicit retail/average labels
     /average\s+(?:retail\s+)?price[:\s]+\$?(\d+(?:\.\d{2})?)/i,
-    /avg[.\s]+(?:price[:\s]+)?\$?(\d+(?:\.\d{2})?)/i,
+    /avg(?:erage)?[.\s]+(?:price[:\s]+)?\$?(\d+(?:\.\d{2})?)/i,
+    /retail\s+price[:\s]+\$?(\d+(?:\.\d{2})?)/i,
     /retail[:\s]+\$?(\d+(?:\.\d{2})?)/i,
-    /from\s+\$(\d+(?:\.\d{2})?)/i,
+    // Wine-Searcher / wine.com style snippets
+    /buy\s+from\s+\$(\d+(?:\.\d{2})?)/i,
     /buy\s+(?:for\s+)?\$(\d+(?:\.\d{2})?)/i,
-    /\$(\d{2,3}(?:\.\d{2})?)\s+(?:at|from|per\s+bottle)/i,
+    /from\s+\$(\d+(?:\.\d{2})?)\b/i,
+    /\$(\d+(?:\.\d{2})?)\s+(?:at|from|per bottle|\/btl|\/bottle)/i,
+    /(?:price|cost|value)[:\s]+\$?(\d+(?:\.\d{2})?)/i,
+    // Catch-all: any dollar amount in a reasonable range (last resort)
+    /\$(\d{2,4}(?:\.\d{2})?)/,
   ];
+  const seen = new Set<number>();
+  const candidates: number[] = [];
   for (const p of patterns) {
     const m = text.match(p);
     if (m) {
       const price = parseFloat(m[1]);
-      if (price >= 5 && price <= 5000) return price;
+      if (price >= 8 && price <= 3000 && !seen.has(price)) {
+        seen.add(price);
+        candidates.push(price);
+      }
     }
   }
-  return null;
+  // Return the lowest plausible price found (retail is usually the smallest number)
+  return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
 function sourceFromUrl(url: string): string {
@@ -211,7 +228,7 @@ async function searchWineInfo(wine: Wine): Promise<SearchInfo> {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ q: query, num: 7 }),
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(5000),
     });
 
     if (!resp.ok) throw new Error(`Serper returned ${resp.status}`);
@@ -239,8 +256,9 @@ async function searchWineInfo(wine: Wine): Promise<SearchInfo> {
 
       if (!retailPrice) {
         const price = extractRetailPrice(combined);
-        // Only accept retail price that's plausibly lower than or close to restaurant price
-        if (price && price < wine.restaurantPrice * 1.1) {
+        // Accept retail if it's plausibly lower than the restaurant list price
+        // (restaurant markup is almost always >1x, so retail < list price)
+        if (price && price < wine.restaurantPrice) {
           retailPrice = price;
         }
       }
@@ -309,18 +327,33 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'No wines could be detected. Try a clearer photo.' }, { status: 400 });
     }
 
-    // 2. Search for each wine in parallel batches
-    const BATCH = 4;
-    const results: WineResult[] = [];
+    // 2. Prioritize red wines, then fill remaining slots with other types.
+    //    Cap total searches to stay within Vercel's 55s timeout budget.
+    //    With BATCH=8 concurrent and 5s timeout: 50 wines ≈ 7 rounds × 5s = 35s search
+    //    + ~15-20s for Claude extraction = ~50-55s total.
+    const MAX_TO_SEARCH = 50;
+    const BATCH = 8;
 
-    for (let i = 0; i < wines.length; i += BATCH) {
-      const batch = wines.slice(i, i + BATCH);
+    const sortByPriceDesc = (a: Wine, b: Wine) => b.restaurantPrice - a.restaurantPrice;
+    const reds   = wines.filter(w => w.type === 'red').sort(sortByPriceDesc);
+    const others = wines.filter(w => w.type !== 'red').sort(sortByPriceDesc);
+
+    // Fill quota: all reds up to MAX_TO_SEARCH, then remaining slots with other types
+    const redSlots   = Math.min(reds.length, MAX_TO_SEARCH);
+    const otherSlots = Math.min(others.length, MAX_TO_SEARCH - redSlots);
+    const winesToSearch = [...reds.slice(0, redSlots), ...others.slice(0, otherSlots)];
+    const notSearched   = [...reds.slice(redSlots), ...others.slice(otherSlots)];
+
+    console.log(`Searching ${winesToSearch.length} wines (${redSlots} reds + ${otherSlots} other) out of ${wines.length} total`);
+
+    const searchedResults: WineResult[] = [];
+    for (let i = 0; i < winesToSearch.length; i += BATCH) {
+      const batch = winesToSearch.slice(i, i + BATCH);
       const batchResults = await Promise.all(
         batch.map(async (wine) => {
           const { rating, ratingSource, retailPrice, snippets } = await searchWineInfo(wine);
           const markupRatio = retailPrice ? parseFloat((wine.restaurantPrice / retailPrice).toFixed(2)) : null;
           const vs = calcValueScore(rating, wine.restaurantPrice, retailPrice);
-
           return {
             ...wine,
             rating,
@@ -333,8 +366,22 @@ export async function POST(request: NextRequest) {
           } as WineResult;
         })
       );
-      results.push(...batchResults);
+      searchedResults.push(...batchResults);
     }
+
+    // Wines not searched get null scores but are still returned for completeness
+    const unsearchedResults: WineResult[] = notSearched.map(wine => ({
+      ...wine,
+      rating: null,
+      ratingSource: null,
+      retailPrice: null,
+      markupRatio: null,
+      valueScore: null,
+      valueLabel: null,
+      snippets: [],
+    }));
+
+    const results = [...searchedResults, ...unsearchedResults];
 
     // 3. Sort: fully scored first (by valueScore desc), then partially scored, then unscored
     results.sort((a, b) => {
@@ -349,6 +396,7 @@ export async function POST(request: NextRequest) {
     const response: AnalyzeResponse = {
       wines: results,
       totalFound: wines.length,
+      searchedCount: winesToSearch.length,
       analyzedCount: results.filter((w) => w.valueScore !== null).length,
     };
 

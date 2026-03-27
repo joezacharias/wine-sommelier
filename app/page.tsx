@@ -331,7 +331,7 @@ function ResultsView({ data, onReset }: { data: AnalyzeResponse; onReset: () => 
           <div className="flex-1">
             <h1 className="text-base font-bold text-white">Wine Analysis</h1>
             <p className="text-xs text-purple-400">
-              {data.totalFound} wines found · {data.analyzedCount} fully scored
+              {data.totalFound} wines found · {data.searchedCount ?? data.analyzedCount} searched · {data.analyzedCount} scored
             </p>
           </div>
           <div className="w-7 h-7 text-wine-500">
