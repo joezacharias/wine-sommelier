@@ -38,21 +38,26 @@ async function extractWinesFromFile(file: File): Promise<Wine[]> {
   const buffer = Buffer.from(await file.arrayBuffer());
   const base64 = buffer.toString('base64');
 
+  // Pipe-delimited format uses ~3x fewer tokens than JSON — critical for large wine lists
   const extractionPrompt = `You are a professional sommelier analyzing a restaurant wine list.
 
-Extract every wine and return them as a JSON array. Each object must have exactly these fields:
-- "name": producer and wine name (string, e.g. "Caymus Cabernet Sauvignon")
-- "vintage": year as a string (e.g. "2021"), or "NV" if not shown
-- "price": list price as a plain number, no $ sign (e.g. 95)
-- "type": exactly one of: red, white, rosé, sparkling, dessert
+Extract every wine and output one line per wine in this exact format:
+name|vintage|price|type
 
-CRITICAL: Your entire response must be ONLY the raw JSON array starting with [ and ending with ].
-Do NOT include any markdown, code fences, backticks, explanation, or any text outside the JSON array.
+Rules:
+- name: producer and wine name (e.g. Caymus Cabernet Sauvignon)
+- vintage: 4-digit year (e.g. 2021) or NV if not shown
+- price: list price as a plain integer, no $ or decimals (e.g. 95)
+- type: one of: red, white, rose, sparkling, dessert
+- Use | as the separator. No quotes, no extra spaces around |
+- Output ONLY the data lines. No headers, no explanation, no blank lines.
 
-Example of the exact format required:
-[{"name":"Caymus Cabernet Sauvignon","vintage":"2021","price":95,"type":"red"},{"name":"Cloudy Bay Sauvignon Blanc","vintage":"2022","price":65,"type":"white"}]
+Example output:
+Caymus Cabernet Sauvignon|2021|95|red
+Cloudy Bay Sauvignon Blanc|2022|65|white
+Laurent Perrier Brut|NV|68|sparkling
 
-Extract every wine on the list. Use price 0 if no price is shown.`;
+Extract every wine. Use 0 for price if not shown.`;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let messageContent: any[];
@@ -82,8 +87,8 @@ Extract every wine on the list. Use price 0 if no price is shown.`;
 
   const response = await anthropic.messages.create({
     model: 'claude-opus-4-6',
-    max_tokens: 8192,
-    system: 'You are a wine list parser. You only respond with raw JSON arrays. Never use markdown, code fences, or explanatory text. Your entire response must start with [ and end with ].',
+    max_tokens: 16384,
+    system: 'You are a wine list parser. Output only pipe-delimited data lines (name|vintage|price|type). No JSON, no markdown, no headers, no explanation.',
     messages: [{ role: 'user', content: messageContent }],
   });
 
@@ -91,65 +96,43 @@ Extract every wine on the list. Use price 0 if no price is shown.`;
 
   console.log(`Claude response: ${text.length} chars, stop_reason: ${response.stop_reason}`);
 
-  // If Claude hit the token limit the JSON will be truncated and unparseable
-  if (response.stop_reason === 'max_tokens') {
-    throw new Error('The wine list has too many items to process at once. Try cropping the PDF to just one page or section.');
-  }
+  // Parse pipe-delimited lines: name|vintage|price|type
+  const lines = text
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.includes('|') && !l.startsWith('#'));
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let raw: any[] | null = null;
-  let parseError = '';
-
-  // Strategy 1: direct parse (cleanest — works when Claude returns pure JSON)
-  try { raw = JSON.parse(text.trim()); } catch (e) { parseError = String(e); }
-
-  // Strategy 2: strip markdown code fences then parse
-  if (!Array.isArray(raw)) {
-    const stripped = text.replace(/```(?:json)?/gi, '').trim();
-    try { raw = JSON.parse(stripped); } catch (e) { parseError = String(e); }
-  }
-
-  // Strategy 3: bracket-counting extraction (handles any surrounding text correctly,
-  // avoids regex catastrophic backtracking on large responses)
-  if (!Array.isArray(raw)) {
-    const start = text.indexOf('[');
-    if (start !== -1) {
-      let depth = 0, end = -1, inStr = false, esc = false;
-      for (let i = start; i < text.length; i++) {
-        const ch = text[i];
-        if (esc)              { esc = false; continue; }
-        if (ch === '\\' && inStr) { esc = true;  continue; }
-        if (ch === '"')       { inStr = !inStr;  continue; }
-        if (!inStr) {
-          if (ch === '[') depth++;
-          else if (ch === ']') { depth--; if (depth === 0) { end = i; break; } }
-        }
-      }
-      if (end !== -1) {
-        try { raw = JSON.parse(text.slice(start, end + 1)); } catch (e) { parseError = String(e); }
-      }
-    }
-  }
-
-  if (!Array.isArray(raw)) {
-    console.error('All parse strategies failed:', parseError);
-    console.error('Response start:', text.slice(0, 300));
-    console.error('Response end:',  text.slice(-300));
+  if (lines.length === 0) {
+    console.error('No pipe-delimited lines found. Response:', text.slice(0, 500));
     throw new Error('Could not read the wine list. Make sure the PDF is a wine/beverage menu with prices.');
   }
 
-  console.log(`Successfully parsed ${raw.length} wines (${text.length} chars)`);
+  // If truncated, we still use whatever wines were extracted
+  if (response.stop_reason === 'max_tokens') {
+    console.warn(`Response truncated — using ${lines.length} wines extracted before cutoff`);
+  }
 
-  return raw
-    .filter((w) => w.name && w.price !== undefined)
-    .map((w) => ({
-      name: String(w.name).trim(),
-      vintage: String(w.vintage || 'NV').trim(),
-      restaurantPrice: parseFloat(w.price) || 0,
-      type: (['red', 'white', 'rosé', 'sparkling', 'dessert'].includes(w.type)
-        ? w.type
-        : 'unknown') as Wine['type'],
-    }));
+  console.log(`Successfully parsed ${lines.length} wines (${text.length} chars)`);
+
+  const typeMap: Record<string, Wine['type']> = {
+    red: 'red', white: 'white', rose: 'rosé', rosé: 'rosé',
+    sparkling: 'sparkling', dessert: 'dessert',
+  };
+
+  return lines
+    .map(line => {
+      const parts = line.split('|');
+      if (parts.length < 3) return null;
+      const [name, vintage, priceStr, typeRaw] = parts;
+      const type = typeMap[typeRaw?.trim().toLowerCase()] ?? 'unknown';
+      return {
+        name: name.trim(),
+        vintage: vintage?.trim() || 'NV',
+        restaurantPrice: parseFloat(priceStr) || 0,
+        type,
+      };
+    })
+    .filter((w): w is Wine => w !== null && w.name.length > 0);
 }
 
 // ---------------------------------------------------------------------------
