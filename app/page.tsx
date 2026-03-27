@@ -4,6 +4,49 @@ import { useState, useRef, useCallback } from 'react';
 import type { WineResult, AnalyzeResponse } from './api/analyze/route';
 
 // ---------------------------------------------------------------------------
+// Image compression (keeps photos under Vercel's 4.5MB request limit)
+// ---------------------------------------------------------------------------
+
+async function compressImage(file: File, maxMB = 3.5): Promise<File> {
+  // PDFs and already-small files pass through unchanged
+  if (file.type === 'application/pdf' || file.size <= maxMB * 1024 * 1024) return file;
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement('canvas');
+      let { width, height } = img;
+
+      // Scale down to max 2400px on the longest side
+      const maxDim = 2400;
+      if (width > maxDim || height > maxDim) {
+        if (width >= height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+      }
+
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0, width, height);
+
+      canvas.toBlob(
+        (blob) => resolve(new File([blob!], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg' })),
+        'image/jpeg',
+        0.88
+      );
+    };
+    img.src = url;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Icons (inline SVGs to avoid extra deps)
 // ---------------------------------------------------------------------------
 
@@ -583,8 +626,11 @@ export default function App() {
     ];
 
     try {
+      // Compress large images before uploading (Vercel limit: 4.5MB)
+      const uploadFile = await compressImage(file);
+
       const formData = new FormData();
-      formData.append('file', file);
+      formData.append('file', uploadFile);
 
       const resp = await fetch('/api/analyze', {
         method: 'POST',
@@ -593,9 +639,20 @@ export default function App() {
 
       stepTimers.forEach(clearTimeout);
 
-      const data = await resp.json();
+      // Safely parse JSON — Vercel may return plain-text errors (e.g. 413 Too Large)
+      let data: Record<string, unknown>;
+      try {
+        data = await resp.json();
+      } catch {
+        const statusMsg: Record<number, string> = {
+          413: 'Image is too large. Try a lower-resolution photo.',
+          504: 'Request timed out. Try a shorter wine list.',
+        };
+        throw new Error(statusMsg[resp.status] ?? `Server error ${resp.status}: ${resp.statusText}`);
+      }
+
       if (!resp.ok) {
-        throw new Error(data.error ?? `Server error ${resp.status}`);
+        throw new Error((data.error as string) ?? `Server error ${resp.status}`);
       }
 
       setResults(data as AnalyzeResponse);
