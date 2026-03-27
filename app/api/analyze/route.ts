@@ -228,7 +228,7 @@ async function searchWineInfo(wine: Wine): Promise<SearchInfo> {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ q: query, num: 7 }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(3500),
     });
 
     if (!resp.ok) throw new Error(`Serper returned ${resp.status}`);
@@ -328,46 +328,45 @@ export async function POST(request: NextRequest) {
     }
 
     // 2. Prioritize red wines, then fill remaining slots with other types.
-    //    Cap total searches to stay within Vercel's 55s timeout budget.
-    //    With BATCH=8 concurrent and 5s timeout: 50 wines ≈ 7 rounds × 5s = 35s search
-    //    + ~15-20s for Claude extraction = ~50-55s total.
-    const MAX_TO_SEARCH = 50;
-    const BATCH = 8;
+    //    Budget breakdown on Vercel Hobby (55s max):
+    //      ~25-30s  Claude PDF extraction
+    //      ~3-4s    all searches fired concurrently (no serial batching)
+    //    = ~30-34s total — safely under 55s
+    //
+    //    Cap at 20 wines; fire ALL searches at once so wall-clock search
+    //    time = one timeout period (~3.5s) regardless of count.
+    const MAX_TO_SEARCH = 20;
 
     const sortByPriceDesc = (a: Wine, b: Wine) => b.restaurantPrice - a.restaurantPrice;
     const reds   = wines.filter(w => w.type === 'red').sort(sortByPriceDesc);
     const others = wines.filter(w => w.type !== 'red').sort(sortByPriceDesc);
 
-    // Fill quota: all reds up to MAX_TO_SEARCH, then remaining slots with other types
+    // Fill quota: reds first (highest-priced), then other types for remaining slots
     const redSlots   = Math.min(reds.length, MAX_TO_SEARCH);
     const otherSlots = Math.min(others.length, MAX_TO_SEARCH - redSlots);
     const winesToSearch = [...reds.slice(0, redSlots), ...others.slice(0, otherSlots)];
     const notSearched   = [...reds.slice(redSlots), ...others.slice(otherSlots)];
 
-    console.log(`Searching ${winesToSearch.length} wines (${redSlots} reds + ${otherSlots} other) out of ${wines.length} total`);
+    console.log(`Searching ${winesToSearch.length} wines (${redSlots} reds + ${otherSlots} other) out of ${wines.length} total — all concurrent`);
 
-    const searchedResults: WineResult[] = [];
-    for (let i = 0; i < winesToSearch.length; i += BATCH) {
-      const batch = winesToSearch.slice(i, i + BATCH);
-      const batchResults = await Promise.all(
-        batch.map(async (wine) => {
-          const { rating, ratingSource, retailPrice, snippets } = await searchWineInfo(wine);
-          const markupRatio = retailPrice ? parseFloat((wine.restaurantPrice / retailPrice).toFixed(2)) : null;
-          const vs = calcValueScore(rating, wine.restaurantPrice, retailPrice);
-          return {
-            ...wine,
-            rating,
-            ratingSource,
-            retailPrice,
-            markupRatio,
-            valueScore: vs,
-            valueLabel: valueLabel(vs),
-            snippets,
-          } as WineResult;
-        })
-      );
-      searchedResults.push(...batchResults);
-    }
+    // Fire all searches at once — wall-clock time = one 3.5s timeout, not N×timeout
+    const searchedResults: WineResult[] = await Promise.all(
+      winesToSearch.map(async (wine) => {
+        const { rating, ratingSource, retailPrice, snippets } = await searchWineInfo(wine);
+        const markupRatio = retailPrice ? parseFloat((wine.restaurantPrice / retailPrice).toFixed(2)) : null;
+        const vs = calcValueScore(rating, wine.restaurantPrice, retailPrice);
+        return {
+          ...wine,
+          rating,
+          ratingSource,
+          retailPrice,
+          markupRatio,
+          valueScore: vs,
+          valueLabel: valueLabel(vs),
+          snippets,
+        } as WineResult;
+      })
+    );
 
     // Wines not searched get null scores but are still returned for completeness
     const unsearchedResults: WineResult[] = notSearched.map(wine => ({
