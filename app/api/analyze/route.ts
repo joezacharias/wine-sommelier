@@ -81,8 +81,8 @@ Extract every wine on the list. Use price 0 if no price is shown.`;
   }
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 4096,
+    model: 'claude-opus-4-6',
+    max_tokens: 8192,
     system: 'You are a wine list parser. You only respond with raw JSON arrays. Never use markdown, code fences, or explanatory text. Your entire response must start with [ and end with ].',
     messages: [{ role: 'user', content: messageContent }],
   });
@@ -117,9 +117,12 @@ Extract every wine on the list. Use price 0 if no price is shown.`;
   }
 
   if (!raw || !Array.isArray(raw)) {
-    console.error('Claude raw response (unparseable):', text.slice(0, 800));
+    console.error('Claude full response length:', text.length);
+    console.error('Claude raw response (unparseable):', text.slice(0, 1500));
     throw new Error('Could not read the wine list. Make sure the PDF is a wine/beverage menu with prices.');
   }
+
+  console.log(`Successfully parsed ${raw.length} wines from response (${text.length} chars)`);
 
   return raw
     .filter((w) => w.name && w.price !== undefined)
