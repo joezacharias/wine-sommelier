@@ -89,40 +89,56 @@ Extract every wine on the list. Use price 0 if no price is shown.`;
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
 
+  console.log(`Claude response: ${text.length} chars, stop_reason: ${response.stop_reason}`);
+
+  // If Claude hit the token limit the JSON will be truncated and unparseable
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error('The wine list has too many items to process at once. Try cropping the PDF to just one page or section.');
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let raw: any[] | null = null;
+  let parseError = '';
 
-  // Strategy 1: direct parse (Claude returned clean JSON)
-  try { raw = JSON.parse(text.trim()); } catch { /* try next */ }
+  // Strategy 1: direct parse (cleanest — works when Claude returns pure JSON)
+  try { raw = JSON.parse(text.trim()); } catch (e) { parseError = String(e); }
 
   // Strategy 2: strip markdown code fences then parse
-  if (!raw) {
+  if (!Array.isArray(raw)) {
     const stripped = text.replace(/```(?:json)?/gi, '').trim();
-    try { raw = JSON.parse(stripped); } catch { /* try next */ }
+    try { raw = JSON.parse(stripped); } catch (e) { parseError = String(e); }
   }
 
-  // Strategy 3: extract first [...] block with regex
-  if (!raw) {
-    const m = text.match(/\[[\s\S]*\]/);
-    if (m) try { raw = JSON.parse(m[0]); } catch { /* try next */ }
-  }
-
-  // Strategy 4: find the start of [ and parse from there
-  if (!raw) {
+  // Strategy 3: bracket-counting extraction (handles any surrounding text correctly,
+  // avoids regex catastrophic backtracking on large responses)
+  if (!Array.isArray(raw)) {
     const start = text.indexOf('[');
-    const end = text.lastIndexOf(']');
-    if (start !== -1 && end !== -1 && end > start) {
-      try { raw = JSON.parse(text.slice(start, end + 1)); } catch { /* give up */ }
+    if (start !== -1) {
+      let depth = 0, end = -1, inStr = false, esc = false;
+      for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (esc)              { esc = false; continue; }
+        if (ch === '\\' && inStr) { esc = true;  continue; }
+        if (ch === '"')       { inStr = !inStr;  continue; }
+        if (!inStr) {
+          if (ch === '[') depth++;
+          else if (ch === ']') { depth--; if (depth === 0) { end = i; break; } }
+        }
+      }
+      if (end !== -1) {
+        try { raw = JSON.parse(text.slice(start, end + 1)); } catch (e) { parseError = String(e); }
+      }
     }
   }
 
-  if (!raw || !Array.isArray(raw)) {
-    console.error('Claude full response length:', text.length);
-    console.error('Claude raw response (unparseable):', text.slice(0, 1500));
+  if (!Array.isArray(raw)) {
+    console.error('All parse strategies failed:', parseError);
+    console.error('Response start:', text.slice(0, 300));
+    console.error('Response end:',  text.slice(-300));
     throw new Error('Could not read the wine list. Make sure the PDF is a wine/beverage menu with prices.');
   }
 
-  console.log(`Successfully parsed ${raw.length} wines from response (${text.length} chars)`);
+  console.log(`Successfully parsed ${raw.length} wines (${text.length} chars)`);
 
   return raw
     .filter((w) => w.name && w.price !== undefined)
