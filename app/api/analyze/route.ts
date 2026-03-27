@@ -89,9 +89,11 @@ Extract every wine. Use 0 for price if not shown.`;
     ];
   }
 
+  // Haiku is ~8x faster than Opus — critical for fitting inside Vercel Hobby's 10s limit.
+  // Extraction quality is nearly identical for structured wine list parsing.
   const response = await anthropic.messages.create({
-    model: 'claude-opus-4-6',
-    max_tokens: 16384,
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 8192,
     system: 'You are a wine list parser. Output only pipe-delimited data lines (name|vintage|price|type). No JSON, no markdown, no headers, no explanation.',
     messages: [{ role: 'user', content: messageContent }],
   });
@@ -228,7 +230,7 @@ async function searchWineInfo(wine: Wine): Promise<SearchInfo> {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ q: query, num: 7 }),
-      signal: AbortSignal.timeout(3500),
+      signal: AbortSignal.timeout(4000),
     });
 
     if (!resp.ok) throw new Error(`Serper returned ${resp.status}`);
@@ -335,7 +337,7 @@ export async function POST(request: NextRequest) {
     //
     //    Cap at 20 wines; fire ALL searches at once so wall-clock search
     //    time = one timeout period (~3.5s) regardless of count.
-    const MAX_TO_SEARCH = 20;
+    const MAX_TO_SEARCH = 15;
 
     const sortByPriceDesc = (a: Wine, b: Wine) => b.restaurantPrice - a.restaurantPrice;
     const reds   = wines.filter(w => w.type === 'red').sort(sortByPriceDesc);
