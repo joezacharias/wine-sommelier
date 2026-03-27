@@ -81,8 +81,9 @@ Extract every wine on the list. Use price 0 if no price is shown.`;
   }
 
   const response = await anthropic.messages.create({
-    model: 'claude-opus-4-6',
+    model: 'claude-3-5-sonnet-20241022',
     max_tokens: 4096,
+    system: 'You are a wine list parser. You only respond with raw JSON arrays. Never use markdown, code fences, or explanatory text. Your entire response must start with [ and end with ].',
     messages: [{ role: 'user', content: messageContent }],
   });
 
