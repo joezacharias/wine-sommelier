@@ -655,7 +655,7 @@ export default function App() {
         throw new Error((data.error as string) ?? `Server error ${resp.status}`);
       }
 
-      setResults(data as AnalyzeResponse);
+      setResults(data as unknown as AnalyzeResponse);
       setState('results');
     } catch (err: unknown) {
       stepTimers.forEach(clearTimeout);
