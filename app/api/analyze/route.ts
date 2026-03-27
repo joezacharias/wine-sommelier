@@ -38,18 +38,21 @@ async function extractWinesFromFile(file: File): Promise<Wine[]> {
   const buffer = Buffer.from(await file.arrayBuffer());
   const base64 = buffer.toString('base64');
 
-  const extractionPrompt = `You are a professional sommelier. Analyze this wine list and extract every wine entry.
+  const extractionPrompt = `You are a professional sommelier analyzing a restaurant wine list.
 
-For EACH wine, return:
-- name: Full wine name including producer/winery and label (e.g. "Caymus Vineyards Cabernet Sauvignon")
-- vintage: Year if shown (e.g. "2021"), or "NV" if not applicable or not shown
-- price: The restaurant list price as a number (no $ sign)
-- type: One of: red, white, rosé, sparkling, dessert
+Extract every wine and return them as a JSON array. Each object must have exactly these fields:
+- "name": producer and wine name (string, e.g. "Caymus Cabernet Sauvignon")
+- "vintage": year as a string (e.g. "2021"), or "NV" if not shown
+- "price": list price as a plain number, no $ sign (e.g. 95)
+- "type": exactly one of: red, white, rosé, sparkling, dessert
 
-Return ONLY a valid JSON array — no explanation, no markdown, no extra text. Example:
+CRITICAL: Your entire response must be ONLY the raw JSON array starting with [ and ending with ].
+Do NOT include any markdown, code fences, backticks, explanation, or any text outside the JSON array.
+
+Example of the exact format required:
 [{"name":"Caymus Cabernet Sauvignon","vintage":"2021","price":95,"type":"red"},{"name":"Cloudy Bay Sauvignon Blanc","vintage":"2022","price":65,"type":"white"}]
 
-Extract ALL wines visible. If a price is missing, use 0.`;
+Extract every wine on the list. Use price 0 if no price is shown.`;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let messageContent: any[];
@@ -85,12 +88,26 @@ Extract ALL wines visible. If a price is missing, use 0.`;
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
 
-  // Extract JSON array from response
-  const jsonMatch = text.match(/\[[\s\S]*\]/);
-  if (!jsonMatch) throw new Error('Claude could not parse the wine list. Please try a clearer photo or PDF.');
+  // Strip markdown code fences if present (e.g. ```json ... ```)
+  const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+
+  // Extract the JSON array — try stripped text first, then search anywhere in original
+  const jsonMatch = stripped.match(/\[[\s\S]*\]/) ?? text.match(/\[[\s\S]*\]/);
+  if (!jsonMatch) {
+    console.error('Claude raw response:', text.slice(0, 500));
+    throw new Error(
+      'Could not find wine data in the response. Make sure the PDF contains a wine list with names and prices.'
+    );
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const raw: any[] = JSON.parse(jsonMatch[0]);
+  let raw: any[];
+  try {
+    raw = JSON.parse(jsonMatch[0]);
+  } catch {
+    console.error('JSON parse failed on:', jsonMatch[0].slice(0, 300));
+    throw new Error('Wine list was found but could not be read. Please try a different file.');
+  }
 
   return raw
     .filter((w) => w.name && w.price !== undefined)
@@ -299,7 +316,7 @@ export async function POST(request: NextRequest) {
             valueScore: vs,
             valueLabel: valueLabel(vs),
             snippets,
-          } satisfies WineResult;
+          } as WineResult;
         })
       );
       results.push(...batchResults);
