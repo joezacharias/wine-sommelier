@@ -89,25 +89,36 @@ Extract every wine on the list. Use price 0 if no price is shown.`;
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
 
-  // Strip markdown code fences if present (e.g. ```json ... ```)
-  const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let raw: any[] | null = null;
 
-  // Extract the JSON array — try stripped text first, then search anywhere in original
-  const jsonMatch = stripped.match(/\[[\s\S]*\]/) ?? text.match(/\[[\s\S]*\]/);
-  if (!jsonMatch) {
-    console.error('Claude raw response:', text.slice(0, 500));
-    throw new Error(
-      'Could not find wine data in the response. Make sure the PDF contains a wine list with names and prices.'
-    );
+  // Strategy 1: direct parse (Claude returned clean JSON)
+  try { raw = JSON.parse(text.trim()); } catch { /* try next */ }
+
+  // Strategy 2: strip markdown code fences then parse
+  if (!raw) {
+    const stripped = text.replace(/```(?:json)?/gi, '').trim();
+    try { raw = JSON.parse(stripped); } catch { /* try next */ }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let raw: any[];
-  try {
-    raw = JSON.parse(jsonMatch[0]);
-  } catch {
-    console.error('JSON parse failed on:', jsonMatch[0].slice(0, 300));
-    throw new Error('Wine list was found but could not be read. Please try a different file.');
+  // Strategy 3: extract first [...] block with regex
+  if (!raw) {
+    const m = text.match(/\[[\s\S]*\]/);
+    if (m) try { raw = JSON.parse(m[0]); } catch { /* try next */ }
+  }
+
+  // Strategy 4: find the start of [ and parse from there
+  if (!raw) {
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
+    if (start !== -1 && end !== -1 && end > start) {
+      try { raw = JSON.parse(text.slice(start, end + 1)); } catch { /* give up */ }
+    }
+  }
+
+  if (!raw || !Array.isArray(raw)) {
+    console.error('Claude raw response (unparseable):', text.slice(0, 800));
+    throw new Error('Could not read the wine list. Make sure the PDF is a wine/beverage menu with prices.');
   }
 
   return raw
